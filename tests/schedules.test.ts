@@ -1169,6 +1169,14 @@ test(
             const manual = await runNow(await saved(schedule.id));
             assert.equal(manual.statusCode, 200, manual.body);
             assert.equal((await runs(schedule.id)).length, 1);
+            assert.deepEqual(
+              (
+                await db.pool.query('SELECT skipped FROM schedule_runs WHERE turn_id=$1', [
+                  manual.json().turnId,
+                ])
+              ).rows[0].skipped.map((skip: { reason: string }) => skip.reason),
+              ['paused', 'paused'],
+            );
             await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [
               manual.json().turnId,
             ]);
@@ -1285,6 +1293,40 @@ test(
             /This run was due at Fri,? 9 Nov 2035, 08:00 WET and started at Sun,? 11 Nov 2035, 18:12 WET\. 2 later runs were skipped\.$/,
           );
           assert.equal(prompt.replace(/\nThis run was due.*$/, ''), base);
+          const [lateRun] = await runs(late.id);
+          const { thread_id: threadId } = (
+            await db.pool.query('SELECT thread_id FROM turns WHERE id=$1', [lateRun!.turnId])
+          ).rows[0];
+          const posted = async () => {
+            const client = await db.pool.connect();
+            try {
+              const id = await thread.insertAssistantMessage(
+                client,
+                { threadId, turnId: lateRun!.turnId },
+                'Synthetic late result.',
+              );
+              return (await client.query('SELECT presentation FROM messages WHERE id=$1', [id]))
+                .rows[0].presentation;
+            } finally {
+              client.release();
+            }
+          };
+          const first = await posted();
+          assert.deepEqual(
+            {
+              type: first?.type,
+              outcome: first?.outcome,
+              dueAt: first?.dueAt,
+              skipped: first?.skipped.map((skip: { at: string; reason: string }) => skip.reason),
+            },
+            {
+              type: 'schedule-run',
+              outcome: 'ran',
+              dueAt: '2035-11-09T08:00:00.000Z',
+              skipped: ['stopped', 'stopped'],
+            },
+          );
+          assert.equal(await posted(), null);
           clock = before;
         },
       );

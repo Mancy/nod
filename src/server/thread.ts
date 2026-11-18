@@ -3,6 +3,7 @@ import {
   presentationSchema,
   presentationText,
   type Presentation,
+  type ScheduleRunPresentation,
 } from '../shared/presentation.ts';
 import {
   answerChoicesSchema,
@@ -67,7 +68,7 @@ import { inlineAppResult, noMailCheck, type MailCheck } from './integration-resu
 import { saveIntegrationFiles } from './integration-files.ts';
 import { spendingLimitReached, spendingLimitText } from './ledger.ts';
 import type { ExecutionEvent } from '../shared/execution.ts';
-import type { ModelSelection, WorkKind } from '../shared/models.ts';
+import { modelProviderNames, type ModelSelection, type WorkKind } from '../shared/models.ts';
 import { lockKey } from './locks.ts';
 import { redactSecretText } from './redaction.ts';
 import { resemblesTaskAcknowledgement } from '../shared/task-ack.ts';
@@ -154,6 +155,7 @@ export interface ThreadDependencies {
     turnId: string,
   ) => Promise<{ selection: ModelSelection; provider: string; name: string } | undefined>;
   modelAlternative?: () => string | undefined;
+  desktopRuntime?: boolean;
   present?: (
     threadId: string,
     input:
@@ -403,7 +405,12 @@ export async function insertAssistantMessage(
   answerChoices?: AnswerChoices,
   analytics?: CaptureAnalytics,
 ) {
-  const visual = presentation === undefined ? undefined : presentationSchema.parse(presentation);
+  const visual =
+    presentation === undefined
+      ? streamId?.includes('failure:')
+        ? undefined
+        : await scheduleRunNotice(client, turn.turnId, { outcome: 'ran' })
+      : presentationSchema.parse(presentation);
   const choices =
     answerChoices === undefined ? undefined : answerChoicesSchema.parse(answerChoices);
   if (choices) {
@@ -479,7 +486,7 @@ export async function insertAssistantMessage(
       kinds.set(kind, (kinds.get(kind) ?? 0) + 1);
     }
     afterCommit(client, () => {
-      if (visual && visual.type !== 'bug-report')
+      if (visual && visual.type !== 'bug-report' && visual.type !== 'schedule-run')
         analytics({
           event: 'output_created',
           properties: { presentation_kind: visual.type, count: 1 },
@@ -1255,6 +1262,80 @@ function modelRecoveryAdvice(text: string) {
   return `The provider's retry delay is about ${amount} ${unit}${amount === 1 ? '' : 's'}. Check its daily limit or choose another model.`;
 }
 
+const offlineCause =
+  /\(transport cause: (ENOTFOUND|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|ENETDOWN)\)\s*\[request phase: [^\]]*\]$/;
+const offlineHint = `Scheduled tasks run only while this computer is awake and online. To keep them running while it sleeps, [run Nod on a server](https://nod.n8n.io/docs/deploy/self-host/).`;
+
+function offlineFailure(error: unknown, provider: string | undefined) {
+  if (
+    !(error instanceof ModelRequestError) ||
+    ['compatible', 'azure', 'amazon-bedrock'].includes(String(provider))
+  )
+    return;
+  const code = offlineCause.exec(error.message)?.[1];
+  if (!code) return;
+  const name =
+    (modelProviderNames as Record<string, string>)[provider ?? ''] ?? 'the model provider';
+  return {
+    reason: `Nod couldn't reach ${name} because this computer had no internet connection`,
+    code,
+  };
+}
+
+let scheduleRunNotices = false;
+
+async function scheduleRunNotice(
+  client: PoolClient,
+  turnId: string,
+  run: Pick<ScheduleRunPresentation, 'outcome' | 'reason' | 'code' | 'link'>,
+) {
+  scheduleRunNotices ||= Boolean(
+    (
+      await client.query(
+        "SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass('schedule_runs') AND attname='notice_shown'",
+      )
+    ).rowCount,
+  );
+  if (!scheduleRunNotices) return;
+  const row = (
+    await client.query<{
+      scheduleId: string;
+      revision: number;
+      title: string;
+      dueAt: Date;
+      startedAt: Date;
+      skipped: ScheduleRunPresentation['skipped'];
+      timeZone: string;
+      nextRunAt: Date | null;
+    }>(
+      `UPDATE schedule_runs r SET notice_shown=true FROM turns u, schedules s
+       WHERE u.id=$1 AND u.owner_id=$2 AND r.owner_id=u.owner_id AND r.turn_id=u.session_id AND NOT r.notice_shown
+         AND s.id=r.schedule_id AND s.owner_id=r.owner_id
+         AND ${run.outcome === 'failed' ? 'u.id=u.session_id' : "(jsonb_array_length(r.skipped)>0 OR r.created_at-r.scheduled_for>interval '10 minutes')"}
+       RETURNING r.schedule_id AS "scheduleId",r.schedule_revision AS revision,r.title,r.scheduled_for AS "dueAt",r.created_at AS "startedAt",
+         r.skipped,r.time_zone AS "timeZone",CASE WHEN s.enabled THEN s.next_run_at END AS "nextRunAt"`,
+      [turnId, ownerId],
+    )
+  ).rows[0];
+  if (!row) return;
+  return presentationSchema.parse({
+    version: 1,
+    type: 'schedule-run',
+    title: row.title.slice(0, 120),
+    sources: [],
+    scheduleId: row.scheduleId,
+    revision: row.revision,
+    dueAt: row.dueAt.toISOString(),
+    startedAt: row.startedAt.toISOString(),
+    skipped: row.skipped,
+    timeZone: row.timeZone,
+    ...(run.outcome === 'failed' && row.nextRunAt
+      ? { nextRunAt: row.nextRunAt.toISOString() }
+      : {}),
+    ...Object.fromEntries(Object.entries(run).filter(([, value]) => value !== undefined)),
+  });
+}
+
 function failureText(error: unknown) {
   let text = error instanceof Error ? error.message || error.name : String(error);
   if (error instanceof ModelRequestError) text = modelFailureReason(text);
@@ -1272,9 +1353,22 @@ async function failTurn(
     next,
     failure,
     contextExhausted,
-  }: { next?: string; failure?: 'model' | 'unknown'; contextExhausted?: boolean } = {},
+    cause,
+  }: {
+    next?: string;
+    failure?: 'model' | 'offline' | 'unknown';
+    contextExhausted?: boolean;
+    cause?: Pick<ScheduleRunPresentation, 'reason' | 'code' | 'link'>;
+  } = {},
 ) {
-  const modelFailure = failure === 'model';
+  const modelFailure = failure === 'model' || failure === 'offline';
+  const failureStream = contextExhausted
+    ? 'context-failure'
+    : failure === 'offline'
+      ? 'offline-failure'
+      : modelFailure
+        ? 'model-failure'
+        : 'failure';
   const turn = await transaction(async (client) => {
     const thread = await lockThread(client);
     const turn = (
@@ -1330,10 +1424,11 @@ async function failTurn(
       ? presented
       : error === interrupted
         ? `I was interrupted before I finished${work ? ` “${work}”` : ''}. Check anything I may have started before you ask me to continue.`
-        : `I couldn't finish ${work ? `“${work}”` : 'this'}. ${error}${next ? ` ${next}` : ''}`;
-  const message = modelFailure
-    ? `${body}\n\n[Change the model or check its connection in ${appPages['/settings/models']}](/settings/models).`
-    : body;
+        : `I couldn't finish ${work ? `“${work}”` : 'this'}. ${error}${next && (work || failure !== 'offline') ? ` ${next}` : ''}`;
+  const message =
+    failure === 'model'
+      ? `${body}\n\n[Change the model or check its connection in ${appPages['/settings/models']}](/settings/models).`
+      : body;
   await transaction(async (client) => {
     if ((await lockThread(client)).id !== turn.thread_id) return;
     const current = await client.query(
@@ -1347,7 +1442,7 @@ async function failTurn(
         turnId,
         ownerId,
         turn.thread_id,
-        `${contextExhausted ? 'context-failure' : modelFailure ? 'model-failure' : 'failure'}:${turnId}`,
+        `${failureStream}:${turnId}`,
         turn.latest_user_message_id,
         Boolean(turn.task_id || work),
         error,
@@ -1355,7 +1450,7 @@ async function failTurn(
     );
     if (!current.rowCount) return;
     const ref = { threadId: turn.thread_id, turnId, taskMessageId: turn.taskMessageId };
-    const streamId = `${contextExhausted ? 'context-failure' : modelFailure ? 'model-failure' : 'failure'}:${turnId}`;
+    const streamId = `${failureStream}:${turnId}`;
     if (failure === 'unknown')
       await insertBugReportDraft(
         client,
@@ -1364,7 +1459,18 @@ async function failTurn(
         'Nod stopped on an unexpected error while working on a request.',
         streamId,
       );
-    else await insertAssistantMessage(client, ref, message.trim(), [], streamId);
+    else
+      await insertAssistantMessage(
+        client,
+        ref,
+        message.trim(),
+        [],
+        streamId,
+        undefined,
+        modelFailure && cause
+          ? await scheduleRunNotice(client, turnId, { outcome: 'failed', ...cause })
+          : undefined,
+      );
   }, pool);
   return true;
 }
@@ -1735,7 +1841,7 @@ async function executeTurn(turn: any, dependencies: ThreadDependencies) {
     'failed';
   let waitingReason: 'question' | 'approval' | 'credentials' | undefined;
   let limited = false;
-  let failure: 'model' | 'unknown' = 'unknown';
+  let failure: 'model' | 'offline' | 'unknown' = 'unknown';
   if (work)
     dependencies.analytics?.({
       event: 'turn_started',
@@ -2408,12 +2514,21 @@ async function executeTurn(turn: any, dependencies: ThreadDependencies) {
       const limit = await dependencies.spendingLimit?.().catch(() => null);
       await failAtLimit(turnId, limit?.monthlyUsd);
     } else {
-      failure = error instanceof ModelRequestError ? 'model' : 'unknown';
+      const offline = offlineFailure(error, selectedModel?.provider);
+      failure = offline ? 'offline' : error instanceof ModelRequestError ? 'model' : 'unknown';
+      const text = offline ? `${offline.reason} (${offline.code}).` : failureText(error);
+      const alternative = failure === 'model' ? dependencies.modelAlternative?.() : undefined;
+      const server = Boolean(offline && dependencies.desktopRuntime);
       if (
-        await failTurn(turnId, dependencies.present, failureText(error), {
+        await failTurn(turnId, dependencies.present, text, {
           failure,
-          next: failure === 'model' ? dependencies.modelAlternative?.() : undefined,
+          next: alternative ?? (server ? offlineHint : undefined),
           contextExhausted: error instanceof ContextLimitError,
+          cause: offline
+            ? { ...offline, ...(server ? { link: 'server' as const } : {}) }
+            : failure === 'model'
+              ? { reason: [text, alternative].filter(Boolean).join(' '), link: 'models' }
+              : undefined,
         })
       )
         logFailure('turn_failed', error, { threadId, turnId, sessionId: turn.session_id });
@@ -2449,7 +2564,13 @@ async function executeTurn(turn: any, dependencies: ThreadDependencies) {
           queue_duration_ms: Math.max(0, startedAt - new Date(turn.created_at).getTime()),
           ...(waitingReason ? { waiting_reason: waitingReason } : {}),
           ...(outcome === 'failed'
-            ? { failure_reason: limited ? ('spending_limit' as const) : failure }
+            ? {
+                failure_reason: limited
+                  ? ('spending_limit' as const)
+                  : failure === 'offline'
+                    ? 'model'
+                    : failure,
+              }
             : {}),
         },
       });

@@ -276,9 +276,19 @@ export function createSchedules(dependencies: ScheduleDependencies) {
     return gap > 5 * 60_000 ? 'long' : 'short';
   }
 
-  function lateNote(schedule: ScheduleRow) {
-    const due = schedule.kind === 'once' ? schedule.runAt! : schedule.nextRun!;
-    const started = now();
+  function missedFires(schedule: ScheduleRow, due: Date, started: Date) {
+    const fires: Date[] = [];
+    if (schedule.kind === 'recurring' && started.getTime() - due.getTime() > lateAfterMs)
+      for (
+        let next = nextOccurrence(schedule, due)!;
+        next <= started && fires.length < skippedCountLimit;
+        next = nextOccurrence(schedule, next)!
+      )
+        fires.push(next);
+    return fires;
+  }
+
+  function lateNote(schedule: ScheduleRow, due: Date, started: Date, skipped: number) {
     if (started.getTime() - due.getTime() <= lateAfterMs) return '';
     const format = new Intl.DateTimeFormat('en-GB', {
       timeZone: schedule.timeZone,
@@ -291,15 +301,6 @@ export function createSchedules(dependencies: ScheduleDependencies) {
       hourCycle: 'h23',
       timeZoneName: 'short',
     });
-    let skipped = 0;
-    if (schedule.kind === 'recurring') {
-      for (
-        let next = nextOccurrence(schedule, due)!;
-        next <= started && skipped < skippedCountLimit;
-        next = nextOccurrence(schedule, next)!
-      )
-        skipped++;
-    }
     const gap = skipped
       ? ` ${skipped >= skippedCountLimit ? `${skippedCountLimit} or more` : skipped} later ${skipped === 1 ? 'run was' : 'runs were'} skipped.`
       : '';
@@ -358,6 +359,7 @@ export function createSchedules(dependencies: ScheduleDependencies) {
     jobId: string,
     scheduledFor: Date,
     note = '',
+    missed: Date[] = [],
   ) {
     const turnId = await enqueueTurn(
       `Scheduled task: ${row.title}\n${row.prompt}\nDeliver what this schedule asks for in this run, even when an earlier message covered the same ground. When it asks for nothing to be sent, message the owner only about a useful result, a problem or a necessary question.${note}`,
@@ -370,9 +372,21 @@ export function createSchedules(dependencies: ScheduleDependencies) {
         client,
       },
     );
+    const paused =
+      (
+        await client.query<{ skipped: { at: string; reason: 'paused' }[] }>(
+          `UPDATE schedules s SET skipped='[]'::jsonb FROM (SELECT skipped FROM schedules WHERE id=$1 AND owner_id=$2) old
+           WHERE s.id=$1 AND s.owner_id=$2 RETURNING old.skipped`,
+          [row.id, ownerId],
+        )
+      ).rows[0]?.skipped ?? [];
+    const skipped = [
+      ...paused,
+      ...missed.map((at) => ({ at: at.toISOString(), reason: 'stopped' as const })),
+    ].slice(-skippedCountLimit);
     await client.query(
-      `INSERT INTO schedule_runs(id,owner_id,schedule_id,schedule_revision,job_id,title,turn_id,scheduled_for,time_zone,authority,baseline_observation)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      `INSERT INTO schedule_runs(id,owner_id,schedule_id,schedule_revision,job_id,title,turn_id,scheduled_for,time_zone,authority,baseline_observation,skipped)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
       [
         randomUUID(),
         ownerId,
@@ -385,6 +399,7 @@ export function createSchedules(dependencies: ScheduleDependencies) {
         row.timeZone,
         row.authority ? JSON.stringify(row.authority) : null,
         row.baselineObservation ? JSON.stringify(row.baselineObservation) : null,
+        JSON.stringify(skipped),
       ],
     );
     return { turnId };
@@ -473,7 +488,16 @@ export function createSchedules(dependencies: ScheduleDependencies) {
           nextOccurrence(row, new Date(Math.max(now().getTime(), row.nextRun!.getTime()))),
         );
       }
-      if (busy || (row.kind === 'recurring' && dependencies.modelPaused?.(row.model))) return true;
+      if (busy) return true;
+      if (row.kind === 'recurring' && dependencies.modelPaused?.(row.model)) {
+        await client.query(
+          `UPDATE schedules SET skipped=(CASE WHEN jsonb_array_length(skipped)>=$4 THEN skipped-0 ELSE skipped END)
+             ||jsonb_build_array(jsonb_build_object('at',$3::text,'reason','paused'))
+           WHERE id=$1 AND owner_id=$2`,
+          [row.id, ownerId, row.nextRun!.toISOString(), skippedCountLimit],
+        );
+        return true;
+      }
       const unchanged = marker ? `${row.revision}:${marker}` : null;
       if (unchanged) {
         if (
@@ -493,13 +517,10 @@ export function createSchedules(dependencies: ScheduleDependencies) {
           unchanged,
         ]);
       }
-      await startRun(
-        client,
-        row,
-        job.id,
-        row.kind === 'once' ? row.runAt! : row.nextRun!,
-        lateNote(row),
-      );
+      const due = row.kind === 'once' ? row.runAt! : row.nextRun!;
+      const started = now();
+      const missed = missedFires(row, due, started);
+      await startRun(client, row, job.id, due, lateNote(row, due, started, missed.length), missed);
       job.signal.throwIfAborted();
       return true;
     });
@@ -544,6 +565,10 @@ export function createSchedules(dependencies: ScheduleDependencies) {
       ALTER TABLE schedule_runs DROP COLUMN IF EXISTS authority_instruction, DROP COLUMN IF EXISTS authority_source_message_id, DROP COLUMN IF EXISTS authority_context;
       ALTER TABLE schedules ADD COLUMN IF NOT EXISTS watch jsonb, ADD COLUMN IF NOT EXISTS watch_marker text;
       ALTER TABLE schedules ADD COLUMN IF NOT EXISTS model jsonb;
+      ALTER TABLE schedules ADD COLUMN IF NOT EXISTS skipped jsonb NOT NULL DEFAULT '[]'::jsonb;
+      ALTER TABLE schedule_runs ADD COLUMN IF NOT EXISTS skipped jsonb NOT NULL DEFAULT '[]'::jsonb,
+        ADD COLUMN IF NOT EXISTS notice_shown boolean NOT NULL DEFAULT true;
+      ALTER TABLE schedule_runs ALTER COLUMN notice_shown SET DEFAULT false;
       ALTER TABLE schedule_runs ADD COLUMN IF NOT EXISTS baseline_observation jsonb,
         ADD COLUMN IF NOT EXISTS observation jsonb, ADD COLUMN IF NOT EXISTS observed_at timestamptz;
       CREATE INDEX IF NOT EXISTS schedule_runs_owner_time ON schedule_runs(owner_id,created_at DESC,id DESC);
@@ -1135,7 +1160,7 @@ export function createSchedules(dependencies: ScheduleDependencies) {
           `UPDATE schedules SET title=$3,prompt=$4,kind=$5,cron=$6,run_at=$7,time_zone=$8,
              enabled=$9,authority=$10::jsonb,
              baseline_observation=COALESCE($11::jsonb,baseline_observation),
-             watch=CASE WHEN $12 THEN $13::jsonb ELSE watch END,revision=revision+1 WHERE id=$1 AND owner_id=$2 RETURNING ${columns}`,
+             watch=CASE WHEN $12 THEN $13::jsonb ELSE watch END,skipped='[]'::jsonb,revision=revision+1 WHERE id=$1 AND owner_id=$2 RETURNING ${columns}`,
           [
             id,
             ownerId,

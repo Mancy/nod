@@ -6122,6 +6122,12 @@ test(
           await failing.complete('Sam');
           await failing.delivered();
           assert.deepEqual(await ownerCards(ownerId), before);
+          assert.deepEqual(
+            (await ownerCards('synthetic-other-owner'))[0].suggestions.tasks.map(
+              (task: { origin?: string }) => task.origin,
+            ),
+            ['fixed', 'fixed', 'fixed', 'common', 'common'],
+          );
           const firstGreeting = (
             await db.pool.query(
               'SELECT greeting_message_id FROM onboarding_suggestions WHERE owner_id=$1',
@@ -10518,6 +10524,148 @@ test(
             for (const item of cases) modelErrors.delete(item.prompt);
             presentInterruption = previousPresenter;
             delete dependencies.modelAlternative;
+          }
+        },
+      );
+
+      await t.test(
+        'a model request that found no network states that cause instead of model settings',
+        async () => {
+          dependencies.modelAlternative = () => 'Synthetic alternative connection.';
+          const prefix =
+            'The model request failed: anthropic / fixture-model: Connection error.: getaddrinfo ENOTFOUND synthetic-offline.invalid';
+          const cases = [
+            { prompt: 'offline desktop schedule fixture', code: 'ENOTFOUND', desktop: true },
+            {
+              prompt: 'offline desktop chat fixture',
+              code: 'EAI_AGAIN',
+              desktop: true,
+              chat: true,
+            },
+            { prompt: 'offline server schedule fixture', code: 'ENETUNREACH', desktop: false },
+            {
+              prompt: 'offline owner endpoint schedule fixture',
+              code: 'ENOTFOUND',
+              desktop: true,
+              provider: 'compatible',
+            },
+            {
+              prompt: 'offline azure endpoint schedule fixture',
+              code: 'EAI_AGAIN',
+              desktop: true,
+              provider: 'azure',
+            },
+            {
+              prompt: 'offline bedrock schedule fixture',
+              code: 'ENOTFOUND',
+              desktop: true,
+              provider: 'amazon-bedrock',
+            },
+          ];
+          const previousWorkModel = dependencies.workModel;
+          try {
+            for (const item of cases) {
+              const raw = `${prefix} (transport cause: ${item.code}) [request phase: request]`;
+              modelErrors.set(item.prompt, raw);
+              dependencies.desktopRuntime = item.desktop;
+              dependencies.workModel = async () => ({
+                selection: { connectionId: randomUUID(), modelId: 'fixture-model', effort: 'low' },
+                provider: item.provider ?? 'anthropic',
+                name: 'fixture-model',
+              });
+              const scheduleId = randomUUID();
+              const turnId = item.chat
+                ? (await thread.submitUserMessage(item.prompt)).turnId
+                : await transaction(async (client) => {
+                    await client.query(
+                      `INSERT INTO schedules(id,owner_id,title,prompt,cron,time_zone,next_run_at,revision)
+                       VALUES($1,$2,$3,$4,'0 8 * * *','Europe/Lisbon',now()+interval '1 day',3)`,
+                      [scheduleId, ownerId, item.prompt, item.prompt],
+                    );
+                    const id = await thread.enqueueTurn(item.prompt, {
+                      source: 'schedule',
+                      sourceId: `schedule:${scheduleId}:${randomUUID()}`,
+                      client,
+                    });
+                    await client.query(
+                      `INSERT INTO schedule_runs(id,owner_id,schedule_id,schedule_revision,job_id,title,turn_id,scheduled_for,time_zone)
+                       VALUES($1,$2,$3,0,$4,$5,$6,now()-interval '72 minutes','Europe/Lisbon')`,
+                      [randomUUID(), ownerId, scheduleId, randomUUID(), item.prompt, id],
+                    );
+                    return id;
+                  }, db.pool);
+              await waitFor(settled(turnId));
+              const streamId = `${item.provider ? 'model' : 'offline'}-failure:${turnId}`;
+              await waitFor(async () =>
+                Boolean(
+                  (
+                    await db.pool.query(
+                      "SELECT 1 FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
+                      [turnId, streamId],
+                    )
+                  ).rowCount,
+                ),
+              );
+              const turn = (
+                await db.pool.query('SELECT status,error FROM turns WHERE id=$1', [turnId])
+              ).rows[0] as { status: string; error: string };
+              const { text: shown, presentation } = (
+                await db.pool.query(
+                  "SELECT text,presentation FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
+                  [turnId, streamId],
+                )
+              ).rows[0] as { text: string; presentation: Record<string, unknown> | null };
+              const hinted = /\]\(https:\/\/nod\.n8n\.io\/docs\/deploy\/self-host\/\)/;
+              if (item.chat) assert.equal(presentation, null);
+              else
+                assert.deepEqual(
+                  {
+                    type: presentation?.type,
+                    scheduleId: presentation?.scheduleId,
+                    outcome: presentation?.outcome,
+                    code: presentation?.code,
+                    link: presentation?.link,
+                    late:
+                      Date.parse(String(presentation?.startedAt)) -
+                        Date.parse(String(presentation?.dueAt)) >
+                      600_000,
+                    next: typeof presentation?.nextRunAt,
+                    revision: presentation?.revision,
+                  },
+                  {
+                    type: 'schedule-run',
+                    scheduleId,
+                    outcome: 'failed',
+                    code: item.provider ? undefined : item.code,
+                    link: item.provider ? 'models' : item.desktop ? 'server' : undefined,
+                    late: true,
+                    next: 'string',
+                    revision: 0,
+                  },
+                );
+              assert.equal(turn.status, 'failed');
+              assert.ok(shown.includes(turn.error));
+              if (item.provider) {
+                assert.equal(turn.error, raw);
+                assert.match(shown, /\]\(\/settings\/models\)/);
+                assert.doesNotMatch(shown, hinted);
+                continue;
+              }
+              assert.match(turn.error, /\bAnthropic\b/);
+              assert.ok(turn.error.includes(`(${item.code})`));
+              assert.doesNotMatch(
+                turn.error,
+                /transport cause|request phase|getaddrinfo|synthetic-offline/,
+              );
+              assert.doesNotMatch(shown, /settings\/models|Synthetic alternative connection/);
+              if (item.desktop && !item.chat) assert.match(shown, hinted);
+              else assert.doesNotMatch(shown, hinted);
+            }
+          } finally {
+            for (const item of cases) modelErrors.delete(item.prompt);
+            delete dependencies.modelAlternative;
+            delete dependencies.desktopRuntime;
+            dependencies.workModel = previousWorkModel;
           }
         },
       );

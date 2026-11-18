@@ -712,10 +712,12 @@ export function Chat({
   const working = live.some((item) => !item.background);
   const lastMessage = allMessages.at(-1);
   const beforeLast = allMessages.at(-2);
+  const failureKind = lastMessage?.streamId?.split(':')[0];
+  const modelAdvice = failureKind !== 'offline-failure' || Boolean(state.configuration.modelIssue);
   const modelFailed =
     lastMessage?.role === 'assistant' &&
     lastMessage.id !== recovered &&
-    lastMessage.streamId?.startsWith('model-failure:') &&
+    (failureKind === 'model-failure' || failureKind === 'offline-failure') &&
     beforeLast?.role === 'user' &&
     beforeLast.turnId === lastMessage.turnId;
   const failedRequest =
@@ -2272,7 +2274,7 @@ export function Chat({
                           ...(task.kind
                             ? { kind: task.kind === 'ongoing' ? 'ongoing' : 'immediate' }
                             : {}),
-                          origin: task.origin === 'common' ? 'common' : 'learned',
+                          origin: task.origin ?? 'learned',
                           position,
                         });
                         void send(task.title, [], null, 'task_card');
@@ -2528,13 +2530,14 @@ export function Chat({
           {state.configuration.llmReady &&
             !state.chatRecovery &&
             (state.configuration.modelIssue ||
-              (modelFailed && (failedRequest || state.configuration.modelAlternative))) && (
+              (modelFailed &&
+                (failedRequest || (modelAdvice && state.configuration.modelAlternative)))) && (
               <Notice kind="info">
                 {state.configuration.modelIssue
                   ? `Your model’s last request failed: ${state.configuration.modelIssue.reason.replace(/(?<![.!?])$/, '.')}`
                   : 'Your model’s last request failed.'}
                 <span className="notice-actions">
-                  {state.configuration.modelAlternative && (
+                  {modelAdvice && state.configuration.modelAlternative && (
                     <Button
                       type="button"
                       size="sm"
@@ -2556,7 +2559,7 @@ export function Chat({
                       Try again
                     </Button>
                   )}
-                  <a href="/settings/models">{appPages['/settings/models']}</a>
+                  {modelAdvice && <a href="/settings/models">{appPages['/settings/models']}</a>}
                 </span>
               </Notice>
             )}
