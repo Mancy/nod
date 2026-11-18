@@ -63,6 +63,7 @@ import { createIntegrationBrowser } from '../src/server/integration-browser.ts';
 import {
   createDiscoveredTransport,
   ownerAddress,
+  ownerFetch,
   safeRemoteFetch,
 } from '../src/providers/discovered/remote.ts';
 import { createAgentRuntime } from '../src/runtime/index.ts';
@@ -1334,6 +1335,75 @@ function fakeProvider(session: IntegrationSession): IntegrationProvider {
     },
   };
 }
+
+test('remote MCP falls back to HTTP+SSE only when the server refuses Streamable HTTP', async (t) => {
+  const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+  const { SSEServerTransport } = await import('@modelcontextprotocol/sdk/server/sse.js');
+  const token = 'synthetic-legacy-token';
+  const sessions = new Map<string, InstanceType<typeof SSEServerTransport>>();
+  const streams: string[] = [];
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url!, 'http://localhost');
+    const label = String(request.headers['x-fixture-case']);
+    if (url.pathname === '/mcp' && request.method === 'GET') streams.push(label);
+    if (request.headers.authorization !== `Bearer ${token}`) {
+      response.writeHead(401).end();
+      return;
+    }
+    if (url.pathname === '/mcp' && request.method === 'POST') {
+      response.writeHead(label === 'server-error' ? 500 : 405).end();
+      return;
+    }
+    if (url.pathname === '/mcp' && request.method === 'GET') {
+      const transport = new SSEServerTransport('/messages', response);
+      sessions.set(transport.sessionId, transport);
+      const mcp = new McpServer({ name: 'synthetic-legacy', version: '1' });
+      mcp.registerTool('legacy-echo', { description: 'Echo' }, async () => ({
+        content: [{ type: 'text', text: 'synthetic legacy reply' }],
+      }));
+      await mcp.connect(transport);
+      return;
+    }
+    const session = sessions.get(url.searchParams.get('sessionId') ?? '');
+    if (url.pathname === '/messages' && session) {
+      await session.handlePostMessage(request, response);
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const endpoint = `${origin}/mcp`;
+  const transport = createDiscoveredTransport(ownerFetch(origin), async (value) => value);
+  const legacy = { authorization: `Bearer ${token}`, 'x-fixture-case': 'legacy' };
+  const listed = await transport.listTools(endpoint, legacy);
+  assert.deepEqual(
+    listed.tools.map((tool) => tool.name),
+    ['legacy-echo'],
+  );
+  assert.deepEqual(await transport.callTool(endpoint, legacy, 'legacy-echo', {}), {
+    content: [{ type: 'text', text: 'synthetic legacy reply' }],
+  });
+  await assert.rejects(
+    transport.listTools(endpoint, {
+      authorization: 'Bearer synthetic-wrong-token',
+      'x-fixture-case': 'unauthorized',
+    }),
+  );
+  await assert.rejects(
+    transport.listTools(endpoint, { ...legacy, 'x-fixture-case': 'server-error' }),
+  );
+  const unreachable = createDiscoveredTransport(
+    ownerFetch('http://127.0.0.1:1'),
+    async (value) => value,
+  );
+  await assert.rejects(unreachable.listTools('http://127.0.0.1:1/mcp', legacy), /ECONNREFUSED/);
+  assert.deepEqual(streams, ['legacy']);
+});
 
 test(
   'installation identity checkpoints prevent replacement after file loss and recover interrupted first initialization',
