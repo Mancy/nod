@@ -1342,6 +1342,7 @@ test('remote MCP falls back to HTTP+SSE only when the server refuses Streamable 
   const token = 'synthetic-legacy-token';
   const sessions = new Map<string, InstanceType<typeof SSEServerTransport>>();
   const streams: string[] = [];
+  let failure: 'post' | 'stream' | undefined;
   const server = createServer(async (request, response) => {
     const url = new URL(request.url!, 'http://localhost');
     const label = String(request.headers['x-fixture-case']);
@@ -1366,6 +1367,16 @@ test('remote MCP falls back to HTTP+SSE only when the server refuses Streamable 
     }
     const session = sessions.get(url.searchParams.get('sessionId') ?? '');
     if (url.pathname === '/messages' && session) {
+      if (failure) {
+        const current = failure;
+        failure = undefined;
+        if (current === 'post') response.writeHead(429).end('Synthetic rate limit.');
+        else {
+          response.writeHead(202).end();
+          await session.close();
+        }
+        return;
+      }
       await session.handlePostMessage(request, response);
       return;
     }
@@ -1403,6 +1414,21 @@ test('remote MCP falls back to HTTP+SSE only when the server refuses Streamable 
   );
   await assert.rejects(unreachable.listTools('http://127.0.0.1:1/mcp', legacy), /ECONNREFUSED/);
   assert.deepEqual(streams, ['legacy']);
+  failure = 'post';
+  await assert.rejects(
+    transport.callTool(endpoint, legacy, 'legacy-echo', {}),
+    /HTTP 429.*Synthetic rate limit\./,
+  );
+  assert.deepEqual(streams, ['legacy']);
+  await transport.listTools(endpoint, legacy);
+  failure = 'stream';
+  await assert.rejects(
+    transport.callTool(endpoint, legacy, 'legacy-echo', {}, AbortSignal.timeout(5000)),
+    /Connection closed/,
+  );
+  assert.deepEqual(streams, ['legacy', 'legacy']);
+  await transport.listTools(endpoint, legacy);
+  assert.deepEqual(streams, ['legacy', 'legacy', 'legacy']);
 });
 
 test(

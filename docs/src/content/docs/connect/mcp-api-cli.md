@@ -41,6 +41,8 @@ The URL can be a public HTTPS address or, when you type it yourself, an address 
 
 Nod connects to MCP servers over Streamable HTTP. When a server refuses it with a client error other than 401 or 403, Nod tries the older HTTP+SSE transport at the same address, with the same checks. If that also fails, the error shows the Streamable HTTP reason.
 
+A failed tool request keeps the server's status and reason. Nod does not retry it. If the SSE stream closes, the next request opens a new connection.
+
 Ask Nod to connect a service it can't find in the app catalog. Nod proposes a way in, called an access path, and sends you a link to a private setup page. There, you paste a token or sign in. The model never sees the token.
 
 | Access path | What Nod calls                                                 | How it signs in                       |

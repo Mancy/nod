@@ -6,7 +6,7 @@ import { isIP } from 'node:net';
 import { Readable } from 'node:stream';
 import { isDeepStrictEqual } from 'node:util';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+import { SSEClientTransport, SseError } from '@modelcontextprotocol/sdk/client/sse.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { RequestOptions } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import { isPublicAddress, publicUrl } from '../agent-browser/network.ts';
@@ -247,7 +247,9 @@ async function connectRemoteMcp(
       await legacy.close().catch(() => {});
       throw cause;
     }
-    legacy.onerror = dropped;
+    legacy.onerror = (cause) => {
+      if (cause instanceof SseError) dropped();
+    };
     return legacy;
   }
 }
