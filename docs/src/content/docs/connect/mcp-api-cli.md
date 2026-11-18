@@ -39,6 +39,8 @@ To connect an MCP server yourself, open **Apps** and select **Connect MCP**. Ent
 
 The URL can be a public HTTPS address or, when you type it yourself, an address on your own computer or network, such as `http://127.0.0.1:8080/mcp` or a Tailscale name. Without `http://` or `https://`, Nod uses HTTPS. A public HTTPS address you type can also use a port other than 443. In the desktop app, `localhost` is your computer. Inside Docker, it is Nod's container. A private address stays bound to the origin you entered, also when you reconnect. HTTP is allowed only for private addresses. With browser sign-in, the server's sign-in service can be at another address only when that address is public and uses HTTPS on the standard port. Connections that Nod proposes in chat must use a public HTTPS address.
 
+Nod connects to MCP servers over Streamable HTTP. When a server refuses it with a client error other than 401 or 403, Nod tries the older HTTP+SSE transport at the same address, with the same checks. If that also fails, the error shows the Streamable HTTP reason.
+
 Ask Nod to connect a service it can't find in the app catalog. Nod proposes a way in, called an access path, and sends you a link to a private setup page. There, you paste a token or sign in. The model never sees the token.
 
 | Access path | What Nod calls                                                 | How it signs in                       |

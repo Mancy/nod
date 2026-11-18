@@ -6,6 +6,7 @@ import { isIP } from 'node:net';
 import { Readable } from 'node:stream';
 import { isDeepStrictEqual } from 'node:util';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { RequestOptions } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import { isPublicAddress, publicUrl } from '../agent-browser/network.ts';
@@ -210,6 +211,47 @@ function release(pool: Map<string, PooledClient>, key: string, entry: PooledClie
   void entry.ready.then((client) => client.close()).catch(() => {});
 }
 
+async function connectRemoteMcp(
+  endpoint: string,
+  headers: Record<string, string>,
+  request: typeof safeRemoteFetch,
+  dropped: () => void,
+) {
+  const url = new URL(endpoint);
+  const fetch = (input: string | URL | Request, init?: RequestInit) =>
+    request(input, { ...init, redirect: 'error' });
+  const client = new Client({ name: 'nod', version: '0.1.0' });
+  try {
+    await client.connect(
+      new StreamableHTTPClientTransport(url, { requestInit: { headers }, fetch }),
+      { timeout: 60_000 },
+    );
+    return client;
+  } catch (cause) {
+    const status: unknown = Object(cause).code;
+    await client.close().catch(() => {});
+    if (
+      typeof status !== 'number' ||
+      status < 400 ||
+      status >= 500 ||
+      status === 401 ||
+      status === 403
+    )
+      throw cause;
+    const legacy = new Client({ name: 'nod', version: '0.1.0' });
+    try {
+      await legacy.connect(new SSEClientTransport(url, { requestInit: { headers }, fetch }), {
+        timeout: 60_000,
+      });
+    } catch {
+      await legacy.close().catch(() => {});
+      throw cause;
+    }
+    legacy.onerror = dropped;
+    return legacy;
+  }
+}
+
 async function withRemoteMcp<T>(
   endpoint: string,
   headers: Record<string, string>,
@@ -224,16 +266,11 @@ async function withRemoteMcp<T>(
     .digest('hex');
   let entry = pool.get(key);
   if (!entry) {
-    const client = new Client({ name: 'nod', version: '0.1.0' });
-    const transport = new StreamableHTTPClientTransport(new URL(endpoint), {
-      requestInit: { headers },
-      fetch: (input, init) => request(input, { ...init, redirect: 'error' }),
-    });
-    entry = {
-      ready: client.connect(transport, { timeout: 60_000 }).then(() => client),
+    const created: PooledClient = {
+      ready: connectRemoteMcp(endpoint, headers, request, () => release(pool, key, created)),
       active: 0,
     };
-    pool.set(key, entry);
+    pool.set(key, (entry = created));
   }
   const current = entry;
   current.active++;
